@@ -23,6 +23,8 @@ TIME_COL = "observation_timestamp"
 # Module-level collector for inner-train RMSEs (filled by lightgbm_v1 each round,
 # reset by main() before every run so repeated runs don't stack stale scores).
 _TRAIN_RMSES = []
+# Per-round count of val rows with NaN PM10_lag1 (fold-safe boundary effect).
+_VAL_LAG1_NANS = []
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +249,27 @@ CATEGORICAL = ["station"]
 
 
 # ---------------------------------------------------------------------------
+# FEATURE ENGINEERING v3: v1 + four row-local interaction features
+# ---------------------------------------------------------------------------
+def make_features_v3(df):
+    """
+    v1 features plus four row-local interactions (leakage-safe on any slice).
+    Missing inputs stay NaN; LightGBM handles them natively. No imputation.
+    """
+    out = make_features(df)
+    out["PM10_per_WSPM"] = out["PM10"] / (out["WSPM"] + 0.1)
+    out["CO_per_WSPM"] = out["CO"] / (out["WSPM"] + 0.1)
+    out["temp_dewp_spread"] = out["TEMP"] - out["DEWP"]
+    out["PM10_x_wind_clean"] = out["PM10"] * out["wind_is_clean"]
+    return out
+
+
+FEATURES_V3 = FEATURES + [
+    "PM10_per_WSPM", "CO_per_WSPM", "temp_dewp_spread", "PM10_x_wind_clean",
+]
+
+
+# ---------------------------------------------------------------------------
 # MODEL: lightgbm_v1
 # ---------------------------------------------------------------------------
 def lightgbm_v1(train_df, val_df):
@@ -306,14 +329,14 @@ def lightgbm_v1(train_df, val_df):
 # Shared LightGBM fit core (identical settings to lightgbm_v1; parameterised by
 # the feature-engineering fn and feature list so v2 changes ONLY the features).
 # ---------------------------------------------------------------------------
-def _fit_lgbm_core(train_df, val_df, feature_fn, feats, record_train=True):
+def _fit_lgbm_core(train_df, val_df, feature_fn, feats, record_train=True,
+                   learning_rate=0.05, num_leaves=31):
     """
     Fit a lightgbm_v1-style model and predict val_df. Returns (model, preds).
 
-    Same params, same leak-safe chronological 85/15 inner split for early
-    stopping as lightgbm_v1. If record_train, appends the inner-train RMSE to
-    _TRAIN_RMSES (set False for one-off diagnostics so the CV table isn't
-    polluted).
+    Same leak-safe chronological 85/15 inner split for early stopping as
+    lightgbm_v1. Defaults match the champion (lr=0.05, num_leaves=31).
+    If record_train, appends the inner-train RMSE to _TRAIN_RMSES.
     """
     import lightgbm as lgb
 
@@ -332,7 +355,8 @@ def _fit_lgbm_core(train_df, val_df, feature_fn, feats, record_train=True):
         objective="regression",
         metric="rmse",
         n_estimators=2000,
-        learning_rate=0.05,
+        learning_rate=learning_rate,
+        num_leaves=num_leaves,
         random_state=42,
         n_jobs=-1,
         verbose=-1,
@@ -355,16 +379,179 @@ def _fit_lgbm_core(train_df, val_df, feature_fn, feats, record_train=True):
 
 
 # ---------------------------------------------------------------------------
+# MODEL: lightgbm_v3  (v1 recipe + four interaction features)
+# ---------------------------------------------------------------------------
+def lightgbm_v3(train_df, val_df):
+    """
+    Identical to lightgbm_v1 except it uses the v3 feature set (v1 features +
+    PM10_per_WSPM, CO_per_WSPM, temp_dewp_spread, PM10_x_wind_clean).
+
+    Same params, same leak-safe chronological inner early stopping, same
+    categorical station. Does not read val_df[TARGET] (harness blanks it).
+    """
+    _, preds = _fit_lgbm_core(train_df, val_df, make_features_v3, FEATURES_V3,
+                              record_train=True)
+    return preds
+
+
+# ---------------------------------------------------------------------------
+# MODEL: lightgbm_v4  (v3 minus near-dead features; engineering code kept)
+# ---------------------------------------------------------------------------
+# Still computed by make_features_v3; just not fed to this model.
+_V4_DROPPED = [
+    "is_lunar_new_year",
+    "is_heating_season",
+    "CO_per_WSPM",
+    "PM10_x_wind_clean",
+]
+FEATURES_V4 = [f for f in FEATURES_V3 if f not in _V4_DROPPED]
+
+
+def lightgbm_v4(train_df, val_df):
+    """
+    Identical to lightgbm_v3 except it uses the trimmed v4 feature list
+    (v3 minus is_lunar_new_year, is_heating_season, CO_per_WSPM,
+    PM10_x_wind_clean). Feature-engineering code is unchanged so dropped
+    columns can be re-added by putting them back on FEATURES_V4.
+    """
+    _, preds = _fit_lgbm_core(train_df, val_df, make_features_v3, FEATURES_V4,
+                              record_train=True)
+    return preds
+
+
+# ---------------------------------------------------------------------------
+# DIAL TUNING (one change each vs champion = lightgbm_v4)
+# ---------------------------------------------------------------------------
+def lightgbm_lr003(train_df, val_df):
+    """Champion v4 recipe; only change is learning_rate 0.05 -> 0.03."""
+    _, preds = _fit_lgbm_core(
+        train_df, val_df, make_features_v3, FEATURES_V4,
+        record_train=True, learning_rate=0.03, num_leaves=31,
+    )
+    return preds
+
+
+def lightgbm_leaves63(train_df, val_df):
+    """Champion v4 recipe; only change is num_leaves 31 -> 63."""
+    _, preds = _fit_lgbm_core(
+        train_df, val_df, make_features_v3, FEATURES_V4,
+        record_train=True, learning_rate=0.05, num_leaves=63,
+    )
+    return preds
+
+
+# ---------------------------------------------------------------------------
+# FEATURE ENGINEERING v5: per-station, backward-only, predictor-only history
+# ---------------------------------------------------------------------------
+LAG_ROLL_COLS = [
+    "PM10_lag1", "PM10_lag2", "PM10_lag3",
+    "CO_lag1", "CO_lag2",
+    "NO2_lag1",
+    "WSPM_lag1",
+    "PM10_roll3", "CO_roll3",
+]
+
+
+def add_lag_features(df):
+    """
+    Add per-station, backward-only lags/rolls of predictor columns.
+
+    - Grouped by station (never mix stations).
+    - Sorted by time; shift(k) / shift(1).rolling(w) so current and future
+      hours are excluded.
+    - Predictors only: PM10, CO, NO2, WSPM. Never the target.
+    - Early rows stay NaN. Original row order is restored.
+    """
+    out = df.copy()
+    out["_orig_order"] = np.arange(len(out))
+    out = out.sort_values(["station", TIME_COL])
+
+    g = out.groupby("station", sort=False, observed=False)
+    out["PM10_lag1"] = g["PM10"].shift(1)
+    out["PM10_lag2"] = g["PM10"].shift(2)
+    out["PM10_lag3"] = g["PM10"].shift(3)
+    out["CO_lag1"] = g["CO"].shift(1)
+    out["CO_lag2"] = g["CO"].shift(2)
+    out["NO2_lag1"] = g["NO2"].shift(1)
+    out["WSPM_lag1"] = g["WSPM"].shift(1)
+
+    # shift first (drop current hour), then rolling within station so the
+    # window cannot cross a station boundary.
+    pm10_prev = g["PM10"].shift(1)
+    co_prev = g["CO"].shift(1)
+    out["PM10_roll3"] = (
+        pm10_prev.groupby(out["station"], sort=False, observed=False)
+        .rolling(window=3)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+    out["CO_roll3"] = (
+        co_prev.groupby(out["station"], sort=False, observed=False)
+        .rolling(window=3)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+
+    out = out.sort_values("_orig_order").drop(columns=["_orig_order"])
+    return out
+
+
+def make_features_v5(df):
+    """v4-ready row-local features plus fold-local lag/roll history."""
+    return add_lag_features(make_features_v3(df))
+
+
+FEATURES_V5 = FEATURES_V4 + LAG_ROLL_COLS
+
+
+def lightgbm_v5(train_df, val_df):
+    """
+    Champion recipe (FEATURES_V4 + lr=0.03) plus per-station backward lags.
+
+    Lags are computed separately on train_df and val_df (via make_features_v5
+    inside _fit_lgbm_core), so a val row never sees another fold's history.
+    """
+    val_lags = add_lag_features(val_df)
+    _VAL_LAG1_NANS.append(int(val_lags["PM10_lag1"].isna().sum()))
+
+    _, preds = _fit_lgbm_core(
+        train_df, val_df, make_features_v5, FEATURES_V5,
+        record_train=True, learning_rate=0.03, num_leaves=31,
+    )
+    return preds
+
+
+def _print_cv_table(label, per_round):
+    print("\n" + "=" * 64)
+    print(f"RESULTS ({label})  -- train vs val overfitting check")
+    print("=" * 64)
+    print(f"  {'round':>5} | {'train RMSE':>10} | {'val RMSE':>10} | {'gap':>8}")
+    print("  " + "-" * 44)
+    for i, (tr, va) in enumerate(zip(_TRAIN_RMSES, per_round), start=1):
+        print(f"  {i:>5} | {tr:>10.4f} | {va:>10.4f} | {va - tr:>8.4f}")
+    mean_rmse = float(np.mean(per_round)) if per_round else float("nan")
+    print(f"\n  Mean CV RMSE across {len(per_round)} rounds: {mean_rmse:.4f}")
+    return mean_rmse
+
+
+# ---------------------------------------------------------------------------
 # STEP 1 DIAGNOSTIC: feature importances (gain). One-off, NOT logged.
 # ---------------------------------------------------------------------------
-def print_feature_importances():
+def print_feature_importances(feature_fn=None, feats=None, label="lightgbm_v1",
+                             learning_rate=0.05):
     """
-    Train ONE lightgbm_v1-style model on all blocks EXCEPT the latest, then
+    Train ONE lightgbm-style model on all blocks EXCEPT the latest, then
     print every feature's GAIN importance (how much it improved the model),
     sorted descending, with each feature's share of total gain.
 
     Diagnostic only: not run through full CV, not logged to research_log.md.
+    Defaults to the v1 recipe; pass feature_fn/feats/label for v3 etc.
     """
+    if feature_fn is None:
+        feature_fn = make_features
+    if feats is None:
+        feats = FEATURES
+
     df = load_data()
     df_blocked = assign_blocks(df, n_blocks=5)
     blocks = [int(b) for b in sorted(df_blocked["block"].unique())]
@@ -374,8 +561,8 @@ def print_feature_importances():
     val_df = df_blocked[df_blocked["block"] == latest].copy()  # only for API; preds unused
 
     # record_train=False so this diagnostic doesn't touch the CV _TRAIN_RMSES.
-    model, _ = _fit_lgbm_core(train_df, val_df, make_features, FEATURES,
-                              record_train=False)
+    model, _ = _fit_lgbm_core(train_df, val_df, feature_fn, feats,
+                              record_train=False, learning_rate=learning_rate)
 
     # Gain importances straight from the booster (robust regardless of the
     # sklearn wrapper's default importance_type).
@@ -385,14 +572,14 @@ def print_feature_importances():
 
     order = np.argsort(gains)[::-1]
     print("\n" + "=" * 64)
-    print("STEP 1 DIAGNOSTIC: lightgbm_v1 feature importances (gain)")
+    print(f"DIAGNOSTIC: {label} feature importances (gain)")
     print(f"(trained on blocks {blocks[:-1]}; {len(train_df):,} rows; not logged)")
     print("=" * 64)
-    print(f"  {'feature':<20} | {'gain':>16} | {'% of total':>10}")
-    print("  " + "-" * 52)
+    print(f"  {'feature':<22} | {'gain':>16} | {'% of total':>10}")
+    print("  " + "-" * 54)
     for idx in order:
         pct = (gains[idx] / total * 100) if total > 0 else 0.0
-        print(f"  {names[idx]:<20} | {gains[idx]:>16,.1f} | {pct:>9.2f}%")
+        print(f"  {names[idx]:<22} | {gains[idx]:>16,.1f} | {pct:>9.2f}%")
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +748,122 @@ def _verify_submission(out_path):
 
 
 # ---------------------------------------------------------------------------
+# SUBMISSION v2: champion = FEATURES_V4 + learning_rate=0.03
+# ---------------------------------------------------------------------------
+SUBMISSION_V2_PATH = "submission_v2.csv"
+
+
+def make_submission_v2(out_path=SUBMISSION_V2_PATH):
+    """
+    Retrain the current champion (v4 feature list + lr=0.03) on ALL train.csv
+    and write submission_v2.csv. Does not overwrite make_submission / v1.
+
+    time_index on test is re-anchored to the TRAIN origin so the timeline
+    continues 0..41 (train) then 41..47 (test). Test is never used for
+    early stopping. Test row order is preserved for ids.
+    """
+    import lightgbm as lgb
+
+    print("\n" + "=" * 64)
+    print("SUBMISSION v2: FEATURES_V4 + learning_rate=0.03 on ALL train")
+    print("=" * 64)
+    print(f"  Feature list ({len(FEATURES_V4)}): {FEATURES_V4}")
+
+    train_df = load_data()
+    train_feat = make_features_v3(train_df)
+    print(f"  Train rows: {len(train_feat):,}  "
+          f"({train_df[TIME_COL].min()} -> {train_df[TIME_COL].max()})")
+
+    # FILE ORDER — do not sort, ids must match test as written.
+    test_raw = pd.read_csv(TEST_CSV, parse_dates=[TIME_COL])
+    print(f"  Test rows:  {len(test_raw):,}  "
+          f"({test_raw[TIME_COL].min()} -> {test_raw[TIME_COL].max()})")
+    print(f"  Test has {TARGET}? {TARGET in test_raw.columns}  "
+          "(expected False)")
+
+    missing_raw = [c for c in
+                   ["PM10", "SO2", "NO2", "CO", "O3", "TEMP", "PRES", "DEWP",
+                    "RAIN", "WSPM", "hour", "month", "year", "wd", "station",
+                    TIME_COL, "id"]
+                   if c not in test_raw.columns]
+    if missing_raw:
+        raise ValueError(f"test is missing columns needed for features: {missing_raw}")
+
+    test_feat = make_features_v3(test_raw)
+    missing_feat = [c for c in FEATURES_V4 if c not in test_feat.columns]
+    if missing_feat:
+        raise ValueError(f"make_features_v3(test) missing FEATURES_V4: {missing_feat}")
+    print(f"  Sanity: all {len(FEATURES_V4)} v4 model features present on test.")
+
+    # Re-anchor time_index to TRAIN origin (do not use the test-slice min).
+    train_origin = ((train_df["year"] - 2013) * 12 + train_df["month"]).min()
+    test_ti_raw = (test_feat["year"] - 2013) * 12 + test_feat["month"]
+    test_feat["time_index"] = (test_ti_raw - train_origin).astype(int)
+    print(f"  time_index train range: "
+          f"{train_feat['time_index'].min()} -> {train_feat['time_index'].max()}")
+    print(f"  time_index test range:  "
+          f"{test_feat['time_index'].min()} -> {test_feat['time_index'].max()}  "
+          f"(anchored to train origin {train_origin})")
+
+    test_feat["station"] = pd.Categorical(
+        test_feat["station"], categories=train_feat["station"].cat.categories
+    )
+
+    train_sorted = train_feat.sort_values(TIME_COL).reset_index(drop=True)
+    cut = int(len(train_sorted) * 0.85)
+    inner_train = train_sorted.iloc[:cut]
+    inner_watch = train_sorted.iloc[cut:]
+    print(f"  Inner-train: {len(inner_train):,} rows  |  "
+          f"inner-watch: {len(inner_watch):,} rows  (chronological)")
+
+    X_tr, y_tr = inner_train[FEATURES_V4], inner_train[TARGET]
+    X_wt, y_wt = inner_watch[FEATURES_V4], inner_watch[TARGET]
+
+    model = lgb.LGBMRegressor(
+        objective="regression",
+        metric="rmse",
+        n_estimators=2000,
+        learning_rate=0.03,
+        num_leaves=31,
+        random_state=42,
+        n_jobs=-1,
+        verbose=-1,
+    )
+    model.fit(
+        X_tr, y_tr,
+        eval_set=[(X_wt, y_wt)],
+        eval_metric="rmse",
+        categorical_feature=CATEGORICAL,
+        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)],
+    )
+    best_it = model.best_iteration_
+    print(f"  Best iteration (picked on inner-watch only): {best_it}")
+
+    preds = np.asarray(
+        model.predict(test_feat[FEATURES_V4], num_iteration=best_it),
+        dtype=float,
+    )
+    n_neg = int((preds < 0).sum())
+    if n_neg:
+        print(f"  Clipped {n_neg} negative predictions to 0 "
+              f"(raw min was {preds.min():.2f})")
+        preds = np.clip(preds, 0, None)
+    else:
+        print("  No negative predictions to clip.")
+
+    submission = pd.DataFrame({
+        "id": test_raw["id"].values,
+        TARGET: preds,
+    })
+    submission.to_csv(out_path, index=False)
+    print(f"  Wrote {out_path}  (left submission_v1.csv untouched)")
+
+    _verify_submission(out_path)
+    print(f"  Best iteration (repeat): {best_it}")
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # RESEARCH LOG (markdown, append-only)
 # ---------------------------------------------------------------------------
 LOG_PATH = "research_log.md"
@@ -652,7 +955,32 @@ def log_experiment(model, description, per_round_rmses, mean_rmse,
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    make_submission()
+    df = load_data()
+    print(f"Loaded {len(df):,} rows from train.csv (sorted by {TIME_COL}).")
+
+    _TRAIN_RMSES.clear()
+    _VAL_LAG1_NANS.clear()
+
+    per_round, mean_rmse = time_series_cv(df, lightgbm_v5, n_blocks=5)
+    _print_cv_table("lightgbm_v5", per_round)
+
+    print("\nVal rows with NaN PM10_lag1 (fold-safe block-start boundary):")
+    for i, n_nan in enumerate(_VAL_LAG1_NANS, start=1):
+        print(f"  Round {i}: {n_nan:,} val rows have NaN PM10_lag1")
+
+    print_feature_importances(
+        make_features_v5, FEATURES_V5,
+        label="lightgbm_v5", learning_rate=0.03,
+    )
+
+    log_experiment(
+        model="lightgbm_v5",
+        description=("v4 + per-station backward lags/rolls of PM10/CO/NO2/WSPM "
+                     "(lag1-3, roll3); computed per-slice inside fold "
+                     "(fold-safe), predictors only, never target"),
+        per_round_rmses=per_round,
+        mean_rmse=mean_rmse,
+    )
 
 
 if __name__ == "__main__":
