@@ -9,7 +9,7 @@
 
 **Leaderboard file.** `submission.csv` in this folder. That is the exact prediction file under review.
 
-**Local validation.** Average RMSE **27.61** on two chronological winter holdouts inside the labelled period (section 4).
+**Local validation.** Average RMSE **27.61** on two chronological winter holdouts (section 4). Full holdout / leaderboard log: [`SCORES.md`](SCORES.md).
 
 ## 1. Approach
 
@@ -201,4 +201,14 @@ No extra processed dataset is required. Features are built in memory from the of
 
 ## 11. Official leaderboard score
 
-Not recorded in this package. Please add the score shown on the competition site for `submission.csv` if you have it.
+Public RMSE for the frozen file `submission.csv`: **23.89161** (uploaded as `submission.csv`, account andrew_c105).
+
+Earlier legal uploads on the same board (see `SCORES.md` for the full log):
+
+| Upload | Public RMSE |
+|---|---|
+| `submission.csv` (this package) | **23.89161** |
+| `submission_cm.csv` (C only) | 24.23269 |
+| `submission_v8.csv` | 26.94941 |
+| `submission_v8_events.csv` | 27.31382 |
+| `submission_v8_part2.csv` | 27.46496 |

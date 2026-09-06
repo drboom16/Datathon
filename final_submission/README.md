@@ -8,13 +8,14 @@ Upload **this folder only**. It is self-contained.
 
 **`submission.csv`** — exact prediction file (`id`, `PM2_5_next_hour`), 51,063 rows. This is the frozen leaderboard file. Do not replace it with a retrain unless you clearly say so.
 
-**Official leaderboard score for this file:** _add the score from the competition site here._ Local holdout RMSE is 27.61 (see `METHODOLOGY.md`).
+**Official public RMSE for this file: 23.89161.**  
+Local two-winter holdout average: **27.61**. Full tables (every legal upload + ablations): [`SCORES.md`](SCORES.md).
 
 ## Files in this folder
 
 | File | Role |
 |---|---|
-| `METHODOLOGY.md` | Approach, cleaning, features, validation, models, results, limits |
+| `SCORES.md` | Local winter holdouts, expanding-window CV, official leaderboard log |
 | `DISCLOSURE.md` | External data, code, AI tools, post-processing |
 | `train_submit.py` | Validation (optional), training, inference, submission file |
 | `features.py` | Data load + feature generation |
